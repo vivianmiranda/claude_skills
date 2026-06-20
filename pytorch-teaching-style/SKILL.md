@@ -17,6 +17,16 @@ The audience is a learner who is an expert in their own scientific domain
 (cosmology) but a novice in PyTorch and most programming APIs. Optimize for
 clarity and didactic transparency, never for expert-to-expert brevity.
 
+## Only what was asked (no unprompted additions)
+
+- **Deliver exactly the requested change — nothing more.** Do not add
+  features, options, refactors, defensive guards, or numerical/robustness
+  embellishments the user did not ask for. When asked to make a quantity
+  per-column, make it per-column; do not also bolt on a stability trick.
+- **If an extra seems worth it, ask first, in one line,** and let the user
+  decide. Never bundle it into the cell by default. Unrequested scope makes
+  the code harder to read and forces the user to strip it back out.
+
 ## Output: always full cells
 
 - **Deliver complete cells, never snippets.** For any change — even a one-line
@@ -112,3 +122,4 @@ a throwaway venv; the system may lack poppler):
 5. Same APIs/idioms the notebook already uses?
 6. No all-caps emphasis?
 7. If a raw block: pure text, no markup, no bullet markers, hard-wrapped?
+8. Only what was asked — no unprompted features, options, or scope?
