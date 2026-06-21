@@ -135,6 +135,17 @@ the reader.
 - **An additive offset cancels in a difference.** Centering (subtract a
   mean or fiducial) never changes a residual-based loss — only the network
   targets' zero-point. Say so when it matters.
+- **Weight decay belongs only on weight matrices.** L2 pulls every
+  parameter it touches toward 0, which is meaningful only for connection
+  weights. Do not decay learned-activation shape params
+  (`activation_fcn.gamma/beta`), the `Affine`/norm `gain` (inits to 1 —
+  decay drags it to 0 and attenuates the signal), or biases. Either set
+  `weight_decay = 0` (simple; emulators with abundant data rarely need it)
+  or split with the standard `ndim >= 2` rule — weight matrices are 2D,
+  biases / `Affine` / `gamma`/`beta` are 1D:
+  `for _, p in model.named_parameters(): (decay if p.ndim>=2 else
+  no_decay).append(p)`, then two Adam param groups with `weight_decay` on
+  `decay` and `0.0` on `no_decay`.
 
 ## Ground abstractions in the research case
 
