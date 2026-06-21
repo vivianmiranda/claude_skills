@@ -311,6 +311,96 @@ actually what it claims. Prefer to verify the math numerically in isolation —
 round-trip `decode(encode(x)) == x`, chi2 against a direct masked reference,
 chi2 against cosmolike's own value — rather than trusting a read.
 
+## Performance: diagnose first, then make a real run fast
+
+The notebook teaches at toy scale (10k dvs), but real research is millions of
+dvs and runs measured in days. The transferable lesson is a method, not a trick:
+measure, fix the top bottleneck, re-measure — because the bottleneck moves.
+
+- **Profile, do not guess.** `torch.profiler.profile(activities=[CPU, CUDA],
+  schedule=schedule(wait,warmup,active))` over a few steady-state steps, tag
+  sections with `record_function`; or `perf_counter` + `torch.cuda.synchronize()`
+  for a coarse split. Sort by `self_cuda_time_total`; export a Chrome trace to
+  see the idle gaps directly.
+- **Read the meters correctly.** GPU-util = fraction of time busy (can be high on
+  slow work); power = how much of the die is lit; the real metric is
+  wall-clock/throughput. High util at low power = a few execution units pinned
+  (e.g. FP64); low util = launch/dispatch-bound (work too cheap to keep the GPU
+  fed). High util is not the goal; low wall-time is.
+- **The bottleneck moves.** This session: FP64 chi2 dominated (90% util, low
+  power) -> made it float32 (~64x) -> became launch-bound (30% util) -> bigger
+  batch + compile. Each fix exposes the next.
+- **FP64 is ~1/64 on consumer GPUs** (FP32 cores / FP64 units per SM, e.g. 128/2
+  on a 3060 — a market-segmentation choice, not physics). Keep heavy math (the
+  chi2 einsum) in float32; do the one-time `eigh` in float64 (numpy, at
+  construction) but store the basis + `Cinv` at a chosen precision: make `dtype`
+  a constructor arg defaulting to `torch.float32` (float64 only when a probe
+  needs it). Verify the precision is enough against a float64 twin — build both,
+  compare chi2; a ~1e-7 relative gap means float32 is safe. (The case study above
+  stores `Cinv` float64 for clarity; in a real run make it the `dtype` arg.)
+- **Tensor-core float32:** `torch.set_float32_matmul_precision("high")` once,
+  globally -> TF32 matmuls (~10-bit mantissa, large speedup, negligible accuracy
+  cost here).
+- **AMP** (`with torch.autocast(device.type, dtype=torch.bfloat16): pred =
+  model(x)`) wraps only the model; the loss stays outside. bf16 needs no
+  `GradScaler` (it keeps float32's exponent range). Only helps once the model —
+  not the loss — is a real fraction of per-batch time.
+- **torch.compile** is useless while one big kernel dominates; it helps once
+  launch-bound (fuses small ops, cuts launches). `mode="reduce-overhead"` (CUDA
+  graphs) needs static shapes, so drop the ragged last minibatch:
+  `n_full = (n // bs) * bs; for s in range(0, n_full, bs): ...` (the dropped rows
+  rotate each epoch since the batch reshuffles, so nothing is permanently lost).
+- **Feed the GPU.** Stage a big chunk on-device once, then minibatch by
+  on-device slicing — no per-batch host->device copy. (The student anti-pattern:
+  CPU-resident tensors + a `DataLoader(num_workers=0)` + per-batch `.to(device)`
+  stalls the GPU on the unoverlapped copy.) And no per-batch host sync: accumulate
+  the running loss on-GPU (`run_sum += loss.detach()*n`), `.item()` once per
+  epoch — `loss.item()` every batch blocks the CPU on the GPU each step.
+- **Scale past GPU RAM (the real case).** A regime ladder chosen at runtime from
+  `psutil.virtual_memory().available`: fits GPU -> cache on GPU; fits RAM ->
+  cache in pinned RAM, stream RAM->GPU; exceeds RAM -> memmap from disk. Two
+  orthogonal gates: a RAM-vs-disk flag (host) and the chunk size (GPU; the
+  `batches_per_load` budget — which must also subtract the resident `Cinv`).
+  Double-buffer the next chunk on a side CUDA stream so I/O overlaps compute (it
+  costs chunk size: two chunks resident). Pre-encode targets once to a smaller
+  file (shrinks I/O, drops the per-chunk whiten; bakes the geometry, so a
+  final-campaign step). Then big batch (+ LR scaling) and `Adam(..., fused=True)`.
+- **A precision perturbation diverges chaotically.** bf16/TF32 change the result
+  from step 1; with a reactive `ReduceLROnPlateau` on a noisy metric the two runs
+  then take different LR paths — so one run is not an A/B. Judge a precision/speed
+  knob with a fixed schedule and a few seeds, not a single number.
+
+## Robust losses and honest metrics
+
+The chi2 loss is outlier-dominated (a sum of squares), so a few bad cosmologies
+can hijack the gradient. Two levers, and a metric discipline.
+
+- **Where the nonlinearity goes matters.** `sqrt(mean(chi2))` is a monotonic
+  rescale of the mean — same gradient direction, outliers still dominate; it only
+  changes the effective LR. To actually down-weight outliers, apply the transform
+  per sample then average: `torch.sqrt(c).mean()` (`c` = per-sample chi2). Prefer
+  the pseudo-Huber `(torch.sqrt(1 + 2*c) - 1).mean()` — quadratic for small c
+  (stable; finite gradient at 0, where pure `sqrt` blows up) and linear for large
+  c (robust).
+- **Trimmed loss** drops the worst k% of the batch before averaging:
+  `k = max(1, int(round((1-trim)*c.numel()))); c,_ = torch.topk(c, k,
+  largest=False)`. `topk` picks which to keep (a non-differentiable choice);
+  gradients still flow through the kept values. It is a hard reject (zero
+  gradient), not a soft down-weight: powerful for contaminated data, a trap for
+  hard-but-real regions (median plummets while the mean/tail freeze near init).
+  Always diagnose which points are trimmed — pull the parameters of the worst val
+  cosmologies. Clustered at parameter extremes (extreme IA, high H0) = real hard
+  physics the trim is hiding; scattered = contamination the trim is right to drop.
+- **Report median and mean.** Emulator error is heavy-tailed: a median of 0.42
+  beside a mean of ~1900 means a great bulk and an abandoned tail. The median
+  alone oversells. The inference-relevant metric is the fraction over a threshold
+  (`frac > 0.2`, `> 1`), and evaluation is never trimmed — eval must see the whole
+  distribution, training-time tricks must not.
+- **Verify numerics in isolation** (also in "Review before a long run"):
+  round-trip `decode(encode(x))`; chi2 vs a direct masked sub-block; a float32
+  path vs a float64 twin; the class path vs cosmolike's own value. Never trust a
+  precision or refactor change without a reference comparison.
+
 ## Quick checklist before sending notebook code
 
 1. Whole cell, paste-ready (not a snippet)?
@@ -324,3 +414,7 @@ chi2 against cosmolike's own value — rather than trusting a read.
 9. Functions take needed values as arguments, not module globals?
 10. Shared logic in one function, called more than once — not duplicated?
 11. Comments formal and definitional (`name = ...`), not chatty?
+12. Heavy math in float32 unless float64 is needed (and verified vs a float64
+    twin)? Precision a `dtype` arg, not hardcoded?
+13. Robust loss applied per-sample (not `sqrt`-of-mean); eval never trimmed;
+    median and mean both reported?
