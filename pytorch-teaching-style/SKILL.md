@@ -558,6 +558,72 @@ can hijack the gradient. Three levers, a metric discipline, and a ceiling.
   path vs a float64 twin; the class path vs cosmolike's own value. Never trust a
   precision or refactor change without a reference comparison.
 
+## Diagnosing an accuracy floor (loss vs optimization vs data vs capacity)
+
+When a metric plateaus above target, find the cause before reaching for a fix:
+the candidate causes (loss shape, optimization, data coverage, model capacity)
+have mutually-exclusive cures, and most of the time the intuitive cause is wrong.
+This ladder, worked end to end on the cosmic-shear emulator's `frac>0.2`, is the
+transferable method.
+
+- **Report a threshold ladder, not one number — tail or shoulder?** Count the
+  fraction over several cutoffs at once (here 0.2, 0.5, 1, 10, 100). A heavy
+  *tail* (a few catastrophic points) is a different problem from a *shoulder*
+  piled just above the threshold. Fit a log-normal to the bulk (its median sets
+  one parameter, the `frac>threshold` sets the other); if that single fit then
+  predicts the *other* thresholds' fractions, the shoulder is just the upper tail
+  of **one broad error distribution**, not a separable sub-population. The
+  consequence is decisive: **you cannot narrow a spread by reweighting**, so any
+  loss-shaping (focal, trim, threshold bump, per-element weight) is dead on
+  arrival for a shoulder — and indeed all of them came back neutral.
+
+- **Separate optimization noise from the floor.** Late-training per-epoch
+  thrashing is a step-size effect (bounce amplitude ~ `lr × gradient_noise`), not
+  the floor. Halve the LR: if the bounce tightens but the plateau does not move,
+  the floor is underneath, and the reported "best" was the lucky bottom of a
+  noisy, best-epoch-selected curve. Batch size is usually a *dead* lever here —
+  under a correct `lr`-vs-`batch` coupling every batch size converges to the same
+  result (the coupling holds the gradient-noise scale fixed); and those coupling
+  rules (`lr ∝ sqrt(bs)` / `∝ bs`) are SGD heuristics — **AdamW needs little to no
+  LR increase with batch**, so naive scaling overshoots and "bigger batch breaks."
+
+- **Diagnose residuals in the metric's own coordinates, not a convenient
+  marginal one.** A chi2 is a sum of squares in the *decorrelated* (whitened)
+  space, so its true drivers are the whitened residual components — not the raw
+  per-element residual in each element's own error bar. A marginal per-element
+  lens will confidently flag a block (for us: the highest source-z bin at small
+  theta) that the metric *barely charges for*, because neighbouring, strongly
+  correlated elements share a cheap common-mode direction. The tell that you are
+  looking at a ghost: **the network leaves large marginal residuals on that block
+  even on the training set and the loss tolerates it** — if the loss cared, the
+  optimizer would have crushed it. Also verify the target basis *is* the metric's
+  basis (`chi2 == ||pred − target||²` to rounding); if not, that gap is a real
+  conditioning mismatch worth fixing, not a physics floor.
+
+- **The decisive test: does the floor appear on the *training* set?** Score train
+  and val at the same metric. `train ≈ val` (the model fails its own training
+  data) is **underfitting** — a representation/capacity limit — and it rules out,
+  *by construction*, more data (cannot help a model that already fails the data it
+  has), regularization (fights overfitting, the opposite problem), and loss
+  shaping (cannot represent a function the model cannot represent). `train ≪ val`
+  is generalization/overfitting (where regularization and data live). This one
+  comparison converts "we are out of ideas" into a definite answer. Confirm a
+  capacity verdict the cheap way: enlarge the model and watch the **training**
+  metric — if it falls, capacity was the limit and is solved.
+
+- **Watch the tempering confound.** If validation is drawn at a different
+  sampling temperature than training (e.g. `T_val = T_train/2`), val has a smaller
+  spread *by construction*, so `val < train` per element is just the temperature,
+  not overfitting or its opposite. Always compare at the metric (`frac>0.2`),
+  never at per-element rms across differently-tempered sets.
+
+The arc to recognize: a stuck metric invites loss-knob roulette (LR, focal kappa,
+bumps, per-element weights), and every turn here was neutral. The progress was
+*elimination* — ruling out optimization, then loss, then a misleading marginal
+diagnostic, then conditioning — until the train-vs-val test named it capacity.
+The number that ends the argument is the *training* metric, not the validation
+one.
+
 ## Quick checklist before sending notebook code
 
 1. Whole cell, paste-ready (not a snippet)?
