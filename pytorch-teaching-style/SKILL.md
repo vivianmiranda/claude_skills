@@ -67,8 +67,11 @@ clarity and didactic transparency, never for expert-to-expert brevity.
   code column, not the full slide, sets the budget. When code sits beside prose,
   aim for ~55.
 - Break long statements with trailing operators, parenthesized continuations,
-  split chained calls, or factored-out intermediates. Use 2-space indentation.
-  Verify the width before sending.
+  split chained calls, or factored-out intermediates. For a wrapped call or
+  signature, break after the opening `(` and use a **2-space hanging indent**
+  for the continuation lines; never align the arguments under the opening
+  paren (that pushes them far right and blows the width budget). Verify the
+  width before sending.
 
 ## Comments and explanations (maximally didactic)
 
@@ -117,6 +120,22 @@ the reader.
   or `act`) and call it once per layer — `norm(size)` — so each layer gets
   its own module; a shared instance ties the layers' learnable parameters
   together. Wrap a size-less module in a lambda: `lambda s: nn.Tanh()`.
+- **Spec dicts for constructible components.** Parameterize each
+  constructible piece (model, optimizer, scheduler) with a dict whose `"cls"`
+  key holds the class — the same first-class-value trick as the factories
+  above — and whose other keys are its constructor kwargs. A small
+  `make_X(spec, injected...)` helper pops `"cls"` and forwards the rest:
+  `make_model(model_opts, in_dim, out_dim, device)`,
+  `make_optimizer(model, opt_opts, lr, device)`,
+  `make_scheduler(opt, sched_opts)`. Keep computed or device-dependent args
+  out of the dict — the helper injects them: the `lr` (batch-scaled), `fused`
+  / `torch.compile` (gated on `device.type`), in/out dims (from data and
+  geometry), the optimizer handed to the scheduler. The driver then takes one
+  spec dict per component (`model_opts`, `opt_opts`, `lr_opts`, `sched_opts`).
+  Caveat: generalizing the scheduler *class* does not generalize *stepping* —
+  `ReduceLROnPlateau` steps with a metric, others with none (branch on
+  `isinstance`); per-batch schedulers (`OneCycleLR`) step inside the batch
+  loop, not once per epoch.
 - **`nn.ModuleList`, never a bare Python list,** for submodules — a plain
   list does not register parameters (missing from `.parameters()`,
   `.to(device)`, `state_dict`). A plain list is fine only as a temporary
@@ -181,13 +200,14 @@ class DataVectorGeometry:
   PROBE_BLOCKS = {"xi": [0], "ggl": [1], "wtheta": [2],
                   "3x2pt": [0, 1, 2]}
 
-  def __init__(self, device, total_size, keep_local,
-               dest_idx, evecs, sqrt_ev, Cinv, center):
+  def __init__(self, device, total_size, dest_idx,
+               evecs, sqrt_ev, Cinv, center):
     # plain: place fields on device. as_tensor accepts numpy
     # (from cosmolike) or cpu tensors (from a saved state).
     self.total_size = int(total_size)
-    self.keep_local = torch.as_tensor(
-      keep_local, dtype=torch.long, device=device)
+    # dest_idx = global positions (in the full 3x2pt vector)
+    # of the unmasked entries; squeeze/unsqueeze/center all
+    # key off it -- never a block-local index (see below).
     self.dest_idx = torch.as_tensor(
       dest_idx, dtype=torch.long, device=device)
     self.evecs = torch.as_tensor(
@@ -205,23 +225,24 @@ class DataVectorGeometry:
 
   @classmethod
   def from_cosmolike(cls, device, dv_center, ...):
-    # read cov/inv_cov/mask/sizes; keep_local = unmasked
-    # block positions (index dv0 cols); dest_idx = their
-    # slots in the full dv; eigh the unmasked block cov;
-    # squeeze dv_center; then build via __init__:
-    return cls(device, total_size, keep_local, dest_idx,
+    # read cov/inv_cov/mask/sizes; keep_cols = offsets of
+    # the unmasked entries within the probe's block(s);
+    # dest_idx = block_global[keep_cols], their global slots
+    # in the full 3x2pt vector; center = dv_center[dest_idx]
+    # (full-vector mean, indexed globally); eigh the unmasked
+    # block cov; then build via __init__:
+    return cls(device, total_size, dest_idx,
                U, sqrt_lam, Cinv, center)
 
   def state(self):                  # tensors to save
     return {"total_size": self.total_size,
-            "keep_local": self.keep_local.cpu(),
             "dest_idx": self.dest_idx.cpu(),
             "evecs": self.evecs.cpu(),
             "sqrt_ev": self.sqrt_ev.cpu(),
             "Cinv": self.Cinv.cpu(),
             "center": self.center.cpu()}  # keys==__init__
 
-  def squeeze(self, dv):   return dv[:, self.keep_local]
+  def squeeze(self, dv):   return dv[:, self.dest_idx]
   def unsqueeze(self, sq):
     full = torch.zeros(sq.shape[0], self.total_size,
                        dtype=sq.dtype, device=sq.device)
@@ -258,8 +279,22 @@ Decisions that shaped it (the reasoning to reuse):
 - **Squeeze to emulate only unmasked entries; unsqueeze for the chi2.** The network
   predicts the smaller unmasked block; `chi2` unsqueezes to the full vector and
   applies the full masked precision — the chi2 is unchanged, only the model shrank.
-  Keep `keep_local` (indexes raw block columns) and `dest_idx` (indexes the full
-  vector) distinct.
+  Index the data, the mean, and the precision by the *global* `dest_idx` (positions
+  in the full 3x2pt vector), never a block-local index. `keep_cols` (offsets within
+  the probe's block) is only the intermediate that builds
+  `dest_idx = block_global[keep_cols]`.
+- **Probe generalization is a review axis, not a freebie.** `xi` is block 0, so
+  block-local offsets equal global indices and much "works by coincidence" — any
+  step correct only because the block starts at 0 is a latent `ggl`/`wtheta` bug.
+  On review, trace every probe-dependent quantity: index the data and the
+  full-vector mean by the global `dest_idx`; assert the dataset width equals
+  `total_size`, so a cosmic-shear-only file fails loudly instead of silently
+  mis-indexing; confirm cosmolike's `get_mask` / `get_cov_masked` / `get_inv_cov`
+  and the block sizes return full-3x2pt-length arrays even under a single-probe
+  init (the front block survives a short return, later blocks do not); and do not
+  reuse the `PROBE_BLOCKS` key as cosmolike's `possible_probes` name unless they
+  match (galaxy-galaxy lensing may be `gammat`, not `ggl`). Take the full-dv length
+  from `total_size`, not a hardcoded literal.
 - **Whiten targets in the covariance eigenbasis** so every output is unit-variance
   and decorrelated (equally hard to fit); the loss un-whitens the residual, so the
   full chi2 is exact regardless. `unwhiten` exactly inverts `whiten` because `U` is
@@ -273,7 +308,8 @@ The arc that produced this (each a one-correction step worth recognizing early):
 monolithic loss class -> split base/subclass; centering in the driver -> moved into
 the class; fiducial center -> training-mean center; treating `get_cov_masked` as raw
 -> using the clean unmasked sub-block; a confusing `__init__(state=None)` switch ->
-explicit `from_cosmolike` / `from_state`.
+explicit `from_cosmolike` / `from_state`; block-local `keep_local` in `squeeze` ->
+global `dest_idx` (an `xi`-only bug that silently breaks `ggl` / `wtheta`).
 
 ## No all-caps for emphasis
 
@@ -306,10 +342,58 @@ a throwaway venv; the system may lack poppler):
 Before an expensive training run, review the whole pipeline for correctness, not
 just style: undefined names, missing imports, and cell-execution order; shape /
 dtype / device consistency end to end; nan paths (a zero normalization scale,
-`sqrt` of a non-positive eigenvalue, `0/0`); and that the loss / whitening math is
-actually what it claims. Prefer to verify the math numerically in isolation —
+`sqrt` of a non-positive eigenvalue, `0/0`); that the loss / whitening math is
+actually what it claims; and the two recurring bug classes in the next section
+(the degenerate-case coincidence, and shared-resource accounting across sequential
+calls). Prefer to verify the math numerically in isolation —
 round-trip `decode(encode(x)) == x`, chi2 against a direct masked reference,
 chi2 against cosmolike's own value — rather than trusting a read.
+
+## Recurring bug classes (review for these, in any codebase)
+
+Two failure modes recurred here and generalize well past this material; both are
+easy to miss because the code runs — they need a reviewer's eye, not a stack
+trace.
+
+- **The degenerate-case coincidence — "works for the default, breaks for the
+  rest."** When code is parameterized over a family of cases (probes, loss modes,
+  data shards, tensor axes, config variants) but only one is ever exercised, an
+  assumption true only for that case slips through — most dangerously when the
+  exercised case has a degenerate property that makes two distinct things
+  accidentally equal: a zero offset, the first or identity element, a single-item
+  collection, a default name that happens to match another. The code is correct by
+  coincidence. On review, trace every parameterized quantity and ask whether it is
+  right for a general member of the family or only because the current one is
+  special; assert the invariant that must hold for all of them; and reason through
+  (or run) a non-degenerate member.
+  Example: `xi` is block 0 of the 3x2pt data vector, so its block-local column
+  indices equal the global ones — hiding a bug where `squeeze` / `center` used the
+  block-local index instead of the global `dest_idx`. It works for `xi` and
+  silently mis-indexes `ggl` / `wtheta` (blocks 1, 2). Same family: a config key
+  reused as an external API string (the `PROBE_BLOCKS` key doubled as cosmolike's
+  `possible_probes` — fine for `"xi"`, but galaxy-galaxy lensing is `"gammat"`,
+  not `"ggl"`); and arrays assumed full-length that only the front block survives
+  when the source returns a short one. Catches: an `assert width == total_size`
+  invariant, decoupling names that only coincide for the default, and indexing by
+  the global index everywhere.
+
+- **Shared-resource accounting across sequential calls.** When one operation that
+  draws from a finite shared resource (memory, GPU VRAM, file handles, a
+  rate / connection / token budget) is split or duplicated into several sequential
+  calls, the accounting must thread the running remainder: call k plans against
+  the budget minus what calls 1..k-1 consumed. A by-value `budget` / `limit`
+  handed to a sequence of allocators is the smell — each sees the full pool, so the
+  total overruns it. And when a budget meets a shared resource, finish the
+  accounting in both directions — name what is over-counted and what is
+  under-counted — never stop at the reassuring half.
+  Example: `build_loaders` was split into a per-source builder called once for the
+  train file then once for the val file; the val call planned against the full
+  VRAM budget while the train set was already resident on the GPU — an
+  over-estimate, an OOM on a tight card. Fix: the per-source builder returns the
+  bytes it made resident, and the orchestrator passes `budget - used_train` to the
+  next. The tell that was missed: a docstring already noted the shared model +
+  `Cinv` were "counted in every call, so conservative" — but that stopped at the
+  safe half and never asked what was un-counted (the resident train pool).
 
 ## Performance: diagnose first, then make a real run fast
 
@@ -361,10 +445,28 @@ measure, fix the top bottleneck, re-measure — because the bottleneck moves.
   cache in pinned RAM, stream RAM->GPU; exceeds RAM -> memmap from disk. Two
   orthogonal gates: a RAM-vs-disk flag (host) and the chunk size (GPU; the
   `batches_per_load` budget — which must also subtract the resident `Cinv`).
+  When the loaders are built once per source (a train file plus a separate val
+  file at T/2), that budget is a shrinking pool, not a constant: each source
+  must subtract what the previous one made resident before the next is sized — a
+  by-value budget handed to a sequence of allocators against one GPU lets the
+  total overrun it (the train set is already on the card when you size the val).
+  Have the per-source builder return the bytes it made resident and pass
+  `budget - used_prev` to the next.
   Double-buffer the next chunk on a side CUDA stream so I/O overlaps compute (it
   costs chunk size: two chunks resident). Pre-encode targets once to a smaller
   file (shrinks I/O, drops the per-chunk whiten; bakes the geometry, so a
   final-campaign step). Then big batch (+ LR scaling) and `Adam(..., fused=True)`.
+- **Train and validate on different distributions cleanly.** When the val set
+  must come from a separate file (e.g. a tempered T/2 draw that stays in the
+  inference-relevant interior, not the broad training prior), build the geometry
+  (whitening center, covmat, `Cinv`) once from the training source and apply it
+  unchanged to the val file — never re-whiten val with its own statistics, or the
+  model sees a transform it never trained on. Plumbing: a single-source loader
+  builder called once per source, an orchestrator returning one `data` dict
+  (`data["train"]` / `data["val"]`, same keys each), and a source-agnostic
+  `eval_val` taking a source sub-dict. Derive the training stats from the
+  canonical training object, not loose globals, so they cannot drift to the wrong
+  file.
 - **A precision perturbation diverges chaotically.** bf16/TF32 change the result
   from step 1; with a reactive `ReduceLROnPlateau` on a noisy metric the two runs
   then take different LR paths — so one run is not an A/B. Judge a precision/speed
@@ -373,7 +475,7 @@ measure, fix the top bottleneck, re-measure — because the bottleneck moves.
 ## Robust losses and honest metrics
 
 The chi2 loss is outlier-dominated (a sum of squares), so a few bad cosmologies
-can hijack the gradient. Two levers, and a metric discipline.
+can hijack the gradient. Three levers, a metric discipline, and a ceiling.
 
 - **Where the nonlinearity goes matters.** `sqrt(mean(chi2))` is a monotonic
   rescale of the mean — same gradient direction, outliers still dominate; it only
@@ -391,6 +493,29 @@ can hijack the gradient. Two levers, and a metric discipline.
   Always diagnose which points are trimmed — pull the parameters of the worst val
   cosmologies. Clustered at parameter extremes (extreme IA, high H0) = real hard
   physics the trim is hiding; scattered = contamination the trim is right to drop.
+- **Focal / hardness reweighting** up-weights the still-hard points so the loss
+  keeps chasing the tail instead of being out-voted by the solved bulk: a weighted
+  mean with `w = (c/(c+kappa))**gamma`, `w` detached (a priority, not a quantity
+  the optimizer can game by shrinking it), normalized by `sum(w)`. Set `kappa` at
+  the threshold you report (`frac>0.2` -> `kappa ~ 0.2`), not higher, or the
+  pressure sits on the wrong band. Failure mode to watch: a monotone focal weight
+  de-protects the points just below the threshold — they lose gradient and drift
+  up across it — so it can make `frac>0.2` worse even while chasing the points
+  above; a soft-threshold bump centered on the line (protect both sides) matches
+  the metric better. Anneal `gamma` from 0 (warm up democratically), and clamp
+  with `max(gamma, 0)` instead of an `if gamma <= 0` branch — at `gamma=0`, `w=1`
+  collapses to the plain mean, so no fragile float-equality test is needed.
+- **Loss-shaping has a ceiling: it cannot fit what training does not cover.** If
+  the persistently-hard points sit where the training set is sparse (e.g. the
+  edges of the sampled prior, which a tighter val draw then probes), no transform,
+  trim schedule, or reweighting fits them — in this material trim-annealing and
+  focal both made the reported metric worse, each only reshuffling which points
+  are bad. Before spending loss-tuning compute, diagnose coverage: pull the
+  parameters of the worst val points (extremes = under-covered, scattered =
+  contamination), and evaluate on the distribution where the model is actually
+  used, not the broad training prior — a "floor" is often an evaluation artifact
+  of grading at the edges. Fix coverage (more data there, or eval where you
+  infer); only then do the loss levers move it.
 - **Report median and mean.** Emulator error is heavy-tailed: a median of 0.42
   beside a mean of ~1900 means a great bulk and an abandoned tail. The median
   alone oversells. The inference-relevant metric is the fraction over a threshold
