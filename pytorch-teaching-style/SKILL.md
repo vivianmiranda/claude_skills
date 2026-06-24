@@ -36,17 +36,47 @@ clarity and didactic transparency, never for expert-to-expert brevity.
   Never send a diff, only the changed lines, or a "replace X with Y" instruction.
   If a change spans multiple cells (e.g. a rename used across them), reprint every
   affected cell in full. No exceptions, even when the edit feels mechanical.
+- **Point to a location by context, never by cell or line number.** The user reads
+  the notebook as slides and cannot see cell indices or line numbers, so "cell 274"
+  or "line 41" is meaningless to them. Anchor every reference to something visible
+  in the content: the enclosing function or class name, a nearby comment or
+  raw-block marker, or a short quoted line (e.g. "the `C_used = param_geom.encode(
+  ...)` line in `_build_loaders_one`"). This holds for bug reports, change
+  locations, and any place you direct the user's attention — not just the cells you
+  hand back.
 
-## Prefer explicit arguments over globals
+## No global variables in functions (flag the rare exception)
 
-- **A function should take what it needs as parameters, not read
-  module-level globals.** Reaching out to enclosing-scope names (stats
-  tensors, data arrays, `device`) hides the function's real inputs and
-  breaks the moment it is reused, moved, or called before those globals
-  exist. Pass them in instead.
-- Default to explicit arguments even when it means a longer signature.
-  Only fall back to a global when threading the value through would be
-  absurdly awkward.
+- **A function takes what it needs as parameters and reads no
+  module-level data global.** Imports and module-level helper
+  functions/classes are not "globals" in this sense — referencing `np`,
+  `torch`, or a `make_X` helper is fine. The rule is about data and
+  state: `device`, normalization stats, a fitted geometry, a config
+  object, dataset arrays. Reaching out to those hides the function's real
+  inputs and breaks the moment it is reused, moved, or called before the
+  global exists. Pass them in, even when the signature gets longer.
+- **A global read is an extreme exception, and never silent.** When
+  threading a value through is genuinely unworkable and a global must be
+  read, flag it in-code on the line that reads it with a visible marker —
+  an emoji and the word WARNING — naming the global and why it is not a
+  parameter, e.g.
+  `# ⚠️ WARNING: reads module global device (not threaded as a param)`.
+  A silent global read is a latent bug and a review red flag; the marker
+  makes the dependency impossible to miss. (This WARNING is the one
+  sanctioned all-caps token — see "No all-caps for emphasis" — a flag
+  label, not emphasis.)
+- **Check for silent globals mechanically, not by eye.** A function's
+  free names should be only its parameters, locals, imports, and
+  module-level helpers; anything else is a data-global read. A `symtable`
+  pass (or a free-variable walk) over the cells lists, per function, the
+  names it treats as global — filter out the imports and helper defs and
+  what remains is the leak set. This catches what reading skips.
+- **The rename hazard makes silent globals worse.** A global read by a
+  now-stale name is the trap: rename the definition (`param_geom` ->
+  `pgeom`) and a caller still passing `param_geometry=param_geom` either
+  raises `NameError` or silently binds a stale value left in the kernel
+  from an earlier run. Passing the parameter explicitly — and flagging
+  any genuinely unavoidable global — removes both failure modes.
 
 ## Simplicity (factor shared logic)
 
@@ -316,7 +346,9 @@ global `dest_idx` (an `xi`-only bug that silently breaks `ggl` / `wtheta`).
 Do not capitalize ordinary words for stress, anywhere: code comments, raw blocks,
 or prose. Emphasize through word choice and sentence structure. Genuinely
 uppercase notation and acronyms are fine (`H` for the Hessian, `1D`, `SGD`, `MSE`,
-`GPU`, `NLL`).
+`GPU`, `NLL`). The single sanctioned exception is the `WARNING` marker that flags
+a function reading a module global (see "No global variables in functions"): there
+`WARNING` is a required flag label, not emphasis.
 
 ## "Raw blocks" (slide prose) are pure plain text
 
@@ -536,7 +568,9 @@ can hijack the gradient. Three levers, a metric discipline, and a ceiling.
 6. No all-caps emphasis?
 7. If a raw block: pure text, no markup, no bullet markers, hard-wrapped?
 8. Only what was asked — no unprompted features, options, or scope?
-9. Functions take needed values as arguments, not module globals?
+9. No function silently reads a data global (only params, locals,
+   imports, helpers)? Any unavoidable global read flagged in-code
+   with the ⚠️ WARNING marker?
 10. Shared logic in one function, called more than once — not duplicated?
 11. Comments formal and definitional (`name = ...`), not chatty?
 12. Heavy math in float32 unless float64 is needed (and verified vs a float64
