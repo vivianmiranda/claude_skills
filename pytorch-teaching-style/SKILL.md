@@ -381,6 +381,27 @@ calls). Prefer to verify the math numerically in isolation —
 round-trip `decode(encode(x)) == x`, chi2 against a direct masked reference,
 chi2 against cosmolike's own value — rather than trusting a read.
 
+**After a mechanical refactor, check it mechanically — the eye misses crossed
+names.** A wide find-and-replace (a rename, swapping `isinstance(x, T)` for a
+capability flag, moving methods between classes) produces edits that *compile*
+but break at runtime, and reading dozens of near-identical cells does not catch
+them. Three cheap automated passes do, and they caught real bugs here:
+(1) **compile every cell** (`compile(src, ...)` after blanking `%`/`!` magic
+lines) — catches the stray or unbalanced paren the eye slides over. (2) **a
+binding check** — for each call/`getattr` you touched, confirm the variable is
+actually a parameter or local of its *enclosing function* (walk the function's
+`symtable`/AST: args + assigned names). This catches a name pasted from the
+wrong template — e.g. `getattr(lossfn, …)` dropped into a function whose
+parameter is `chi2fn` (compiles, `NameError` at run), and the mirror image. Note
+a global read shows as "unbound" too, which is the same scan surfacing the
+"reads a data global" smell. (3) **a leftover scan** — grep for the *old*
+pattern you were replacing (`isinstance(_, OldType)`, `obj.old_attr`,
+`OldClass.from_x(`); zero hits is the done signal. Distinguish raw/markdown
+cells from code cells first (slide-prose "raw" cells look like broken code to a
+naive scan, and a code cell that is actually prose is a latent `SyntaxError`).
+The discipline: a refactor is finished not when it reads right, but when
+compile + binding + leftover-scan are all clean.
+
 ## Recurring bug classes (review for these, in any codebase)
 
 Two failure modes recurred here and generalize well past this material; both are
@@ -407,7 +428,19 @@ trace.
   not `"ggl"`); and arrays assumed full-length that only the front block survives
   when the source returns a short one. Catches: an `assert width == total_size`
   invariant, decoupling names that only coincide for the default, and indexing by
-  the global index everywhere.
+  the global index everywhere. A close cousin is **inferring a capability from a
+  type**: an `isinstance(obj, BaseClass)` test used to mean "this one needs the
+  extra argument / takes the special branch" works only while *every* capable
+  variant subclasses that base — add a sibling that doesn't, or a subclass that
+  opts out, and it silently takes the wrong branch with no error. Prefer an
+  explicit capability flag the object declares
+  (`getattr(obj, "needs_params", False)`) over a type test standing in for a
+  behavior; a new variant then opts in by setting the flag, and one that forgets
+  fails visibly. A matching design move: when one class grows two
+  responsibilities (a data-vector *geometry* and a *loss*), prefer composition —
+  the loss HOLDS the geometry and forwards the few attributes callers read —
+  over inheritance, so one geometry can be wrapped by several losses and a future
+  variant isn't forced into the base type.
 
 - **Shared-resource accounting across sequential calls.** When one operation that
   draws from a finite shared resource (memory, GPU VRAM, file handles, a
@@ -599,17 +632,50 @@ transferable method.
   optimizer would have crushed it. Also verify the target basis *is* the metric's
   basis (`chi2 == ||pred − target||²` to rounding); if not, that gap is a real
   conditioning mismatch worth fixing, not a physics floor.
+  **Which errors the chi2 forgives is set by the covariance's eigen-spectrum, and
+  for a correlation-function data vector the chi2 is a high-pass filter on the
+  error.** Neighbouring points are strongly correlated, so the smooth
+  (low-frequency) covariance eigenmodes carry the largest variance — hence the
+  smallest precision — and the chi2 barely charges a smooth / common-mode error;
+  the oscillatory (high-frequency) eigenmodes are small-variance, high-precision,
+  and the chi2 crushes them. So the metric's blind spot is *smoothness*, not
+  oscillation. Practical corollary that saves a wasted experiment: a smoothness /
+  anti-oscillation regularizer (penalise the second derivative of the prediction)
+  is **redundant** — it duplicates what the chi2 already does to oscillatory error
+  and risks over-smoothing toward the very common-mode the chi2 ignores. The loose
+  screw is the smooth coherent residual, which is physically real so you cannot
+  just penalise it (and the one attempt to add pressure on the chi2's blind spot —
+  a per-element weight — came back neutral).
 
-- **The decisive test: does the floor appear on the *training* set?** Score train
-  and val at the same metric. `train ≈ val` (the model fails its own training
-  data) is **underfitting** — a representation/capacity limit — and it rules out,
-  *by construction*, more data (cannot help a model that already fails the data it
-  has), regularization (fights overfitting, the opposite problem), and loss
-  shaping (cannot represent a function the model cannot represent). `train ≪ val`
-  is generalization/overfitting (where regularization and data live). This one
-  comparison converts "we are out of ideas" into a definite answer. Confirm a
-  capacity verdict the cheap way: enlarge the model and watch the **training**
-  metric — if it falls, capacity was the limit and is solved.
+- **The decisive test is the learning curve, not the train-vs-val gap.** A small
+  `val − train` gap tells you variance is low (you are not overfitting), but it
+  does *not* settle capacity vs data: a regularized model that fits its small
+  training set only partway looks identical (`train ≈ val`, both high) whether the
+  limit is capacity or data sparsity. The question is answered only by the
+  *learning curve* — the metric versus training-set size. Still falling at the
+  largest size you can afford → **data-limited** (more data helps); flattens →
+  **capacity-limited**. It is cheap (a handful of trains) and definitive.
+  Cautionary tale from this material, kept because the trap is common: `train ≈
+  val` at one training size was read as a capacity limit and written down as
+  "earned" — then the learning curve dropped the metric from 0.22 at 10k
+  cosmologies to 0.10 (the target) at 46k. Data-limited the whole time. Do not let
+  the train-vs-val gap stand in for the learning curve: the gap diagnoses
+  overfitting, the curve diagnoses the floor.
+
+- **When data is the binding constraint, the learning curve *is* the objective —
+  "data-limited" does not always mean "add data."** When each training example is
+  expensive (large simulations) or the parameter volume is huge (a high-D, hot
+  prior), you can never afford the data the asymptotic floor would need, so the
+  goal becomes **sample efficiency**: the *position* of the learning curve — the
+  smallest training set that reaches target. Compare methods (preprocessing,
+  architecture, input features, sampling) by N-to-target, not by the floor at one
+  size: a lever that is *neutral at the floor* can still shift the curve far left,
+  and that left-shift is the whole deliverable. Physics-informed preprocessing is
+  the canonical case — it removes variance the network would otherwise learn from
+  data, so its payoff is largest in the *low-data* regime and must be measured
+  there, not at whatever single training size was convenient. (Worked example: a
+  rescaling that "did nothing" at the 10%-of-pool size is exactly the kind of lever
+  whose value only shows as a left-shift at small N.)
 
 - **Watch the tempering confound.** If validation is drawn at a different
   sampling temperature than training (e.g. `T_val = T_train/2`), val has a smaller
@@ -618,11 +684,13 @@ transferable method.
   never at per-element rms across differently-tempered sets.
 
 The arc to recognize: a stuck metric invites loss-knob roulette (LR, focal kappa,
-bumps, per-element weights), and every turn here was neutral. The progress was
-*elimination* — ruling out optimization, then loss, then a misleading marginal
-diagnostic, then conditioning — until the train-vs-val test named it capacity.
-The number that ends the argument is the *training* metric, not the validation
-one.
+bumps, per-element weights), and every turn here was neutral — but neutral on the
+loss does not mean capacity. The progress was *elimination*; the resolution was
+the one cheap experiment that directly varies the suspected cause — the learning
+curve (error vs training-set size) — and it named the floor **data**, not
+capacity. The number that ends the argument is the metric's learning curve, not
+any single-split snapshot. The recorded trap: reading a small train-vs-val gap as
+proof of capacity and asserting it before plotting error-versus-`N_train`.
 
 ## Quick checklist before sending notebook code
 
