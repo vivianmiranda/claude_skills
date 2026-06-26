@@ -700,6 +700,23 @@ transferable method.
   sub-net still can't use the axis. Keep one shared trunk; make the *head*
   axis-aware.)
 
+- **Two gotchas when you add that axis-aware head.** (1) It needs the **target in
+  axis order**. If you whiten the target into the *covariance eigenbasis* (to
+  decorrelate it), you scramble the physical axis (ℓ/θ), so the conv slides over
+  eigenmodes, not the axis — no locality, no benefit. Use **diagonal whitening**
+  (scale each element by its marginal σ, *no rotation*) so the output stays in
+  axis order; the chi2 still multiplies σ back and contracts the *full* precision
+  (so `‖pred−target‖² ≠ chi2` — keep the explicit `Cinv` contraction). One-line
+  check: a one-hot input stays one-hot after `whiten` **iff** the whitening is
+  diagonal — if it spreads, the basis is rotating and the conv is on the wrong
+  axis. (2) A multi-channel conv block that **expands then collapses** (`1→C` then
+  `C→1`) gains *nothing* without a **nonlinearity between** them — two stacked
+  linear convs compose to a single `1→1` kernel, so the extra channels are wasted.
+  Put an activation between the expand and the collapse. (Worked example: a global
+  1D-CNN head after a ResMLP, on a diagonally-whitened target, dropped
+  `f(Δχ²>0.2)` 0.24→0.18 at fixed N — the first lever that moved a data-limited
+  plateau.)
+
 - **Watch the tempering confound.** If validation is drawn at a different
   sampling temperature than training (e.g. `T_val = T_train/2`), val has a smaller
   spread *by construction*, so `val < train` per element is just the temperature,
@@ -714,6 +731,95 @@ curve (error vs training-set size) — and it named the floor **data**, not
 capacity. The number that ends the argument is the metric's learning curve, not
 any single-split snapshot. The recorded trap: reading a small train-vs-val gap as
 proof of capacity and asserting it before plotting error-versus-`N_train`.
+
+## Sample efficiency: capacity vs bias vs data, and what actually moves a data floor
+
+Once the floor is named *data* (previous section), a long search over model-side
+knobs is wasted motion. These distinctions, each earned the hard way, say where the
+lever actually is.
+
+- **Three different things, three different roles.** *Capacity* (width / params) is a
+  THRESHOLD — too little underfits, enough represents the map, more is useless (a
+  width sweep that plateaus proves capacity is sufficient: e.g. width 256 == 512 at
+  the same metric). *Inductive bias* (the architecture's preference — locality,
+  smoothness, an activation's shape) is an EFFICIENCY MULTIPLIER — a bias that
+  MATCHES the true structure generalizes better from the same data (lower sample
+  complexity), usually by RESTRICTING capacity to the right functions, not adding it.
+  *Data* is the resource that pins which function you land on. Tuning capacity past
+  the threshold, or a bias that doesn't match the structure, moves nothing.
+
+- **A representation / reparametrization change only helps if you are
+  REPRESENTATION-limited, not data-limited.** "The hard direction is predictable as
+  f(some transform of the inputs)" does NOT imply "feeding that transform as input
+  helps" — a saturated-capacity net already represents the smooth functional form;
+  the limit is how much data constrains it, and a change of input COORDINATES adds no
+  data. (Worked example: the hardness regressed cleanly onto log-parameters, yet a
+  log-whitened input geometry came back neutral — the net already learned the
+  log-linear dependence from linear inputs; the floor was data. A narrow prior also
+  makes ln(x) ~ affine in x, so a log reparam is nearly a no-op until the range is
+  wide.)
+
+- **Capacity and bias are confounded — isolate capacity with a width sweep.** Adding
+  a CNN head or a fancier activation also adds PARAMETERS, so an apparent "bias win"
+  at an under-sized width is often just capacity. Sweep width first; test any bias
+  change at the SATURATED width, where a real bias advantage must show WITHOUT adding
+  capacity. (A multi-knob "win" at width 128 evaporated once width 256 alone matched
+  it.)
+
+- **Read deciles, not overlapping histograms; fit multivariate, not single-param.** A
+  moderate correlation (rank-corr ~0.3) yields histograms that look identical to the
+  eye yet a 2-3x contrast between top and bottom feature/density deciles — trust the
+  deciles. To localize a hard DIRECTION, a multivariate regression on DECORRELATED
+  (e.g. log) features beats a single-parameter scan or an eyeballed scatter: here a
+  one-parameter view fingered the WRONG variable (a confounded proxy that merely
+  shared the real driver), and only the joint fit found the true combination — plus
+  an R^2 saying how much of the difficulty is even a low-order direction vs diffuse.
+
+- **A local-interpolation baseline cannot be a "floor" for a strong global learner.**
+  Comparing the model to local-linear / kNN interpolation of the training targets
+  fails as a data-limit test: a well-trained global net BEATS naive local
+  interpolation by orders of magnitude (it exploits global smoothness, not local
+  density), so the "floor" sits far below the model and the comparison is vacuous.
+  The right data-limit evidence is the LEARNING CURVE plus capacity saturation, not a
+  local oracle.
+
+- **When failures are DIFFUSE, the lever is representation, not sampling.** Active
+  learning / importance sampling beats random only when the error is CONCENTRATED
+  (its whole advantage scales with the non-uniformity of the error landscape); for
+  diffuse, everywhere-failures it degenerates to uniform sampling and earns nothing.
+  Low-discrepancy (Sobol -> probit -> Cholesky) sampling fixes i.i.d. clumping and
+  helps coverage in LOW dimensions, but the advantage vanishes in high dimensions
+  (the discrepancy edge needs N >> 2^d). So in high-D, or with diffuse difficulty,
+  stop trying to PLACE points cleverly and make the FUNCTION easier (fewer effective
+  DOF).
+
+- **High-D: the curse hits LOCAL methods, not a global net on a low-effective-
+  dimension function; spend the budget on the EFFECTIVE dimension and FACTOR OUT
+  known structure.** Sample complexity scales with the number of directions the
+  output depends on strongly and NONLINEARLY (the active subspace), not the nominal
+  parameter count — parameters that act ~linearly (nuisances) are nearly free, so
+  adding many of them does not blow up the data need. The biggest win for a
+  high-order, wide-prior, COUPLED parameter block is to exploit any ANALYTIC
+  structure: if the output is a known polynomial / separable function of those
+  parameters with smooth coefficient-functions of the rest, emulate the smooth
+  COEFFICIENTS and apply the known parameter dependence in CLOSED FORM — the hard
+  parameters leave the emulation entirely (zero training points in their space,
+  prior-width-independent). **Never emulate a parameter dependence you can write
+  down.** (Worked example: cosmic-shear TATT intrinsic alignment — ~5 IA amplitudes
+  entering as products up to quartic over a wide prior — is orders of magnitude
+  harder than the 1-amplitude NLA model; the fix is to emulate the cosmology-only IA
+  TEMPLATES and apply the TATT amplitude polynomial analytically, exactly as one
+  never emulates A_s because it factors out of C_ell.)
+
+- **torch.compile reduce-overhead (CUDA graphs) is fragile — make the mode a knob.** A
+  model that calls helper-object methods, or builds/caches a tensor lazily, INSIDE
+  forward breaks CUDA graphs (a tensor created in the captured forward is overwritten
+  on the next replay); precompute those into registered BUFFERS so forward is a pure
+  static graph. Even then, reduce-overhead can trip an internal CUDA-graph-trees
+  assertion on models with large constant buffers or a skip-add of an intermediate.
+  Make the compile mode a spec-dict option (default reduce-overhead) and drop the
+  fragile model to mode="default" (inductor fusion, no CUDA graphs) — robust, only
+  modestly slower.
 
 ## Quick checklist before sending notebook code
 
