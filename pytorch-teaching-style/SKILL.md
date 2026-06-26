@@ -677,6 +677,29 @@ transferable method.
   rescaling that "did nothing" at the 10%-of-pool size is exactly the kind of lever
   whose value only shows as a left-shift at small N.)
 
+- **For a structured high-dimensional output, the lever is an axis-aware *head*,
+  not a wider dense net — and the tell is a learning-curve *slope*, not a single
+  point.** A dense MLP is output-permutation-invariant: reorder its outputs (and
+  the targets and metric) and it trains identically, so it cannot use any
+  structure along the output axis (smoothness/adjacency in ℓ, θ, λ…). It produces
+  a decent prediction but leaves residuals *structured along that axis*, which it
+  can't correct because every output is an independent readout. A head that *sees*
+  the axis — a 1-D CNN or a transformer over the output sequence, **on top of a
+  shared trunk** — corrects those structured residuals with shared weights, far
+  more sample-efficiently. The data signature is a **slope** difference: the dense
+  net's error-vs-`N_train` curve *flattens* (an architecture-limited floor — more
+  data stops helping), while the axis-aware head's curve keeps descending. So
+  compare architectures by the *shape* of `f`-vs-`N` on log–log (power law
+  `f ~ N^(-α)` → a line of slope `-α`; the exponent is the efficiency rate), not
+  the value at one N — a curve still falling where the baseline has plateaued is
+  the win even before either reaches target. (Worked example: ResMLP+CNN/
+  transformer dropped `f(Δχ²>0.2)` ~0.2→~0.06 vs a bare ResMLP, the bare one
+  plateauing and the axis-aware head not. And the *failed* counter-move — splitting
+  the whole network into independent per-output-group sub-nets — gains nothing: it
+  discards the shared trunk that learns the (shared) input→latent map, and a dense
+  sub-net still can't use the axis. Keep one shared trunk; make the *head*
+  axis-aware.)
+
 - **Watch the tempering confound.** If validation is drawn at a different
   sampling temperature than training (e.g. `T_val = T_train/2`), val has a smaller
   spread *by construction*, so `val < train` per element is just the temperature,
