@@ -811,6 +811,39 @@ lever actually is.
   TEMPLATES and apply the TATT amplitude polynomial analytically, exactly as one
   never emulates A_s because it factors out of C_ell.)
 
+- **A smoothness / low-degree prior cannot lower a floor that is set by data
+  coverage + genuinely non-smooth hardness — it only helps an *under-smoothed*
+  (overfitting) model.** If the model is already smooth (saturated width, `train ≈
+  val`, no wiggle to suppress), a smoothness prior (a low-degree polynomial basis,
+  a PCA/PCE expansion, a curvature penalty) adds no information — it acts as
+  *capacity* (a head start), so it looks like a win only at an under-sized width
+  and evaporates at the saturated one. And a low-degree prior is more sample-
+  efficient *only for the component of the target that is actually low-degree* —
+  which is often the easy part the net already learns, while the floor is set by
+  the hard, non-smooth part where the prior is simply wrong. (Worked example: a
+  sparse-Legendre PCE base under a ResMLP — the "NPCE" — nailed the overall
+  amplitude mode but not the nonlinear shape modes, so it only matched a width
+  doubling. Diagnose *why* the floor is there before reaching for a smoothness
+  prior; if the model isn't overfitting, smoothness is not the missing ingredient.)
+
+- **When you factor out a known parameter dependence, do it as an *architecture*
+  on the *existing* scattered samples — not as data preprocessing.** If the output
+  is exactly `Σ_t c_t(p) · K_t(rest)` (a polynomial / separable form in some
+  parameters `p` with smooth coefficient-functions `K_t` of the rest): have the
+  model emit the `K_t` from the *non-`p`* inputs, and apply the known `c_t(p)` in
+  the LOSS, reading each sample's own `p`. The factored `p` **never enter the
+  network** → exact, prior-width-independent generalization in them, and their
+  prior costs *zero* training coverage. Crucially this needs **no structured
+  re-simulation or explicit extraction**: the existing samples (with `p` drawn
+  across its prior) identify the `K_t` implicitly, because the loss imposes the
+  known structure and `p` varies across samples — so it's the *same* data,
+  apples-to-apples with the baseline. Two musts: **exclude `p` from the model
+  input** (else the net absorbs the dependence and the exact guarantee is lost),
+  and factor only what enters as a *coefficient* — anything inside an integral
+  (e.g. a redshift-evolution power) stays an emulated input. The payoff **scales
+  with `p`'s prior width**: neutral for a narrow/cheap parameter (which still
+  validates the machinery), decisive for wide/coupled/high-order ones.
+
 - **torch.compile reduce-overhead (CUDA graphs) is fragile — make the mode a knob.** A
   model that calls helper-object methods, or builds/caches a tensor lazily, INSIDE
   forward breaks CUDA graphs (a tensor created in the captured forward is overwritten
@@ -820,6 +853,72 @@ lever actually is.
   Make the compile mode a spec-dict option (default reduce-overhead) and drop the
   fragile model to mode="default" (inductor fusion, no CUDA graphs) — robust, only
   modestly slower.
+
+## Translating the teaching notebook into a real .py package
+
+When the slide notebook graduates to a Python package + CLI drivers, the slide
+rules relax and new conventions apply. (Worked example: the cosmic-shear
+notebook's emulator section became an `emulator/` package + `driver/` scripts.)
+
+- **Port BYTE-FAITHFULLY, then verify mechanically.** Extract each def/class
+  straight from the `.ipynb` JSON (do not retype); SCOPE the extraction to the
+  target section's cells so earlier chapters' same-named helpers don't leak (one
+  function was defined 7× across the notebook; another had a stale-global twin),
+  and DEDUP anything defined twice in-section (keep the complete version). Then
+  run the cheap automated passes every time: `ast`-parse each module, a binding
+  check (every cross-module symbol is defined-or-imported in its file), an
+  unused-import scan, and — once you add named arguments — validate every keyword
+  against the callee's REAL signature (a wrong name compiles, fails at call). The
+  port is done when those are clean, not when it reads right.
+
+- **Name every keyword-able argument; comment the irreducibly-positional ones.**
+  For real code the user maintains, prefer explicit names over position ("I'll
+  forget what position 4 is") — our functions, `cls(...)` constructors,
+  `nn.Linear`/`Conv1d` (`in_features=` vs `out_features=`), library config
+  kwargs, `torch.cat(dim=)`. The args that genuinely CANNOT be named (matplotlib
+  `plot`/`semilogy` x/y data, `einsum` operands, the array/tensor SUBJECT of
+  `cat`/`from_numpy`/`asarray`/`zeros`, a module call `model(x)`) stay positional
+  and get a one-line naming comment (`# x = epochs, y = train loss`). Gotcha:
+  never keyword `pred=`/`target=` BEFORE a `*args` forwarder — a non-empty
+  `*args` then refills the slot ("multiple values for 'pred'"); exclude any call
+  with a Starred positional from the keywording pass.
+
+- **Module code can relax the slide rules — confirm the per-artifact convention.**
+  Slides need ≤~60 cols + a hanging indent; a `.py` module can use a wider budget
+  (here 90 cols) and the alignment the user prefers for code (here
+  paren-alignment, one arg per line under the opening paren — the opposite of the
+  slide rule). Don't assume the slide rule carries over; ask/confirm.
+
+- **Keep the didactic comments — especially for tensor-shape ops.** `unsqueeze` /
+  `expand` / `[:, None]` broadcasting / `view` reshape / `searchsorted` are
+  exactly where a domain-expert-but-Python-learner gets lost; a few lines naming
+  the shape change pay off. Watch for a method that SHADOWS a builtin op name (a
+  geometry's own `.unsqueeze` = scatter-to-full-vector vs torch's
+  `tensor.unsqueeze` = insert a size-1 axis) and call the difference out.
+
+- **Config → spec dicts via a resolver; keep the result KEYED, not positional.** A
+  driver reads a YAML and builds the framework's argument dicts. Return them in a
+  dict keyed by the framework's own parameter names so the caller splats
+  `**specs` (a positional N-tuple is the "which slot is this?" trap). Each spec =
+  `{"cls": ChosenClass, **yaml_block}` — the class is the caller's fixed choice,
+  the settings spread from the YAML, so it generalizes across model/optimizer
+  variants without the helper knowing their kwargs.
+
+- **Mark searchable hyperparameters inline so ONE config drives train AND tune.**
+  Convention that worked: a config leaf is a fixed scalar OR a 4-item range
+  `[default, min, max, kind]` with `kind` an EXPLICIT `int`/`float`/`log` (don't
+  infer the type). The first value is the default. Two resolvers walk the nested
+  config — one collapses ranges to their default (the plain trainer), one turns
+  each range into a tuner suggestion named by its dotted path (and warm-starts
+  trial 0 from the defaults). Cast min/max to float so a YAML `1e-5` that the
+  loader parsed as a string still works.
+
+- **A driver in a subfolder must put the repo root on `sys.path`.** Running
+  `python driver/foo.py` puts `driver/` (the script's own dir), NOT the repo
+  root, on `sys.path`, so `import package` fails; a 3-line bootstrap fixes it.
+  Relative imports (`..`) are PACKAGE-relative (resolved by the module's position
+  in the package tree), never relative to the launch directory — so run a
+  submodule as `python -m package.module`, never `python package/module.py`.
 
 ## Quick checklist before sending notebook code
 
